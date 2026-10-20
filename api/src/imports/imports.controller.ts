@@ -16,7 +16,7 @@ import { IMPORT_ADMIN_ROLE, ImportOperationView, ImportsService } from './import
 import { StartImportDto } from './dto/start-import.dto';
 
 @ApiTags('imports')
-@Controller('api/v1/imports')
+@Controller('api/v1/imports/operations')
 @UseGuards(JwtAuthGuard)
 export class ImportsController {
   constructor(private readonly imports: ImportsService) {}

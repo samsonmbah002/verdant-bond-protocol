@@ -87,6 +87,14 @@ export interface UndistributedTotalResponse {
   undistributedTotal: string;
 }
 
+export interface RedeemResponse {
+  bondId: number;
+  investorAddress: string;
+  amount: string;
+  transactionHash: string;
+  status?: string;
+}
+
 /**
  * One itemized claimable-credit line (issue #156). Mirrors the coupon-engine
  * `ClaimableCreditDetail` struct: a single period/report/credit-type accrual
@@ -113,6 +121,30 @@ export interface SweepUndistributedResponse {
   swept: string;
   transactionHash: string;
 }
+
+export interface CouponBatchStatusResponse {
+  bondId: number;
+  periodIndex: number;
+  cursor: number;
+  totalHolders: number;
+  distributed: boolean;
+  totalCreditsEarned: string;
+  undistributed: string;
+  remainingHolders: number;
+}
+
+export interface CouponBatchDistributionResponse {
+  bondId: number;
+  periodIndex: number;
+  offset: number;
+  limit: number;
+  processedCount: number;
+  cursor: number;
+  batchComplete: boolean;
+  totalCredits: string;
+  transactionHash: string;
+}
+
 
 /**
  * Consolidated, atomically-fetched bond detail (issue #4). A single call returns

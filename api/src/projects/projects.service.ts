@@ -1,19 +1,30 @@
-import { Injectable, BadRequestException } from '@nestjs/common';
+import { Injectable, BadRequestException, Optional } from '@nestjs/common';
 import { ContractService } from '../stellar/contract.service';
 import { StellarService } from '../stellar/stellar.service';
 import { IpfsService } from './ipfs.service';
+import { IpfsDocumentCacheService } from './ipfs-document-cache.service';
+import { IpfsAvailabilityService } from './ipfs-availability.service';
 import { NonceService } from '../common/services/nonce.service';
 import { RedisService } from '../common/services/redis.service';
 import { SigningKeyProvider } from '../common/services/signing-key.provider';
 import { nativeToScVal, scValToNative, Address, xdr } from '@stellar/stellar-sdk';
 import { CreateProjectDto } from './dto/create-project.dto';
-import { ProjectResponse, ProjectStatusEnum, DocumentUploadResponse, ProjectProvenanceResponse, ProvenanceEvent, CertificationKind, CertificationVersion, CouponCertification } from './interfaces/project.interface';
+import { UpdateProjectCertificationsDto } from './dto/update-certifications.dto';
+import {
+  ProjectResponse,
+  ProjectStatusEnum,
+  DocumentUploadResponse,
+  ProjectProvenanceResponse,
+  ProvenanceEvent,
+  CertificationKind,
+  CertificationVersion,
+  CouponCertification,
+  UpdateCertificationsResponse,
+} from './interfaces/project.interface';
 import { encodeCid, decodeCid, toBigIntString } from '../common/utils';
 import { ConfigService } from '../config/config.service';
 import { validateGeoJsonBoundary } from './utils/geojson-validator';
 import * as crypto from 'crypto';
-
-
 
 @Injectable()
 export class ProjectsService {
@@ -25,6 +36,8 @@ export class ProjectsService {
     private readonly redis: RedisService,
     private readonly signingKeys: SigningKeyProvider,
     private readonly configService: ConfigService,
+    @Optional() private readonly cacheService?: IpfsDocumentCacheService,
+    @Optional() private readonly availabilityService?: IpfsAvailabilityService,
   ) {}
 
   async register(dto: CreateProjectDto, ownerAddress: string): Promise<ProjectResponse> {
@@ -253,6 +266,106 @@ export class ProjectsService {
     const raw = await this.redis.get(`project:${id}:certifications`);
     return raw ? JSON.parse(raw) : [];
   }
+
+  /**
+   * Idempotent project certification document updates (#459).
+   * Verifies project existence and caller authorization, deduplicates against existing
+   * certifications and documents, appends only net-new versions to the immutable provenance chain,
+   * and preserves existing versions without duplicate errors or state corruption.
+   */
+  async updateProjectCertifications(
+    id: number,
+    dto: UpdateProjectCertificationsDto,
+    callerAddress?: string,
+  ): Promise<UpdateCertificationsResponse> {
+    if (dto.idempotencyKey) {
+      const cached = await this.redis.get(`project:${id}:idempotency:${dto.idempotencyKey}`);
+      if (cached) {
+        return JSON.parse(cached);
+      }
+    }
+
+    const project = await this.findOne(id);
+    if (!project) {
+      throw new BadRequestException(`Project #${id} not found`);
+    }
+
+    if (callerAddress) {
+      let isAdmin = false;
+      try {
+        const adminSecret = this.getAdminSecret();
+        const adminAddress = this.stellarService.getKeypairFromSecret(adminSecret).publicKey();
+        isAdmin = callerAddress === adminAddress;
+      } catch {}
+      const isOwner = project.ownerAddress && callerAddress === project.ownerAddress;
+      if (!isOwner && !isAdmin) {
+        throw new ForbiddenException('Only the project owner or admin can update project certifications');
+      }
+    }
+
+
+    if (!dto.cids || !Array.isArray(dto.cids) || dto.cids.length === 0) {
+      throw new BadRequestException('At least one certification document CID is required');
+    }
+
+    for (const cid of dto.cids) {
+      if (!cid || typeof cid !== 'string' || cid.trim().length === 0) {
+        throw new BadRequestException('Invalid certification CID: must be a non-empty string');
+      }
+    }
+
+    const history = await this.getCertificationHistory(id);
+    const existingCidSet = new Set(history.map((v) => v.cid));
+    const currentVersions = [...history];
+
+    let addedCount = 0;
+    let existingCount = 0;
+
+    for (const cid of dto.cids) {
+      if (existingCidSet.has(cid)) {
+        existingCount++;
+      } else {
+        const previousCid = currentVersions.length > 0 ? currentVersions[currentVersions.length - 1].cid : null;
+        const newVersion: CertificationVersion = {
+          version: currentVersions.length + 1,
+          cid,
+          previousCid,
+          kind: dto.kind ?? 'document',
+          uploadedAt: new Date().toISOString(),
+        };
+        currentVersions.push(newVersion);
+        existingCidSet.add(cid);
+        addedCount++;
+      }
+    }
+
+    if (addedCount > 0) {
+      await this.redis.set(`project:${id}:certifications`, JSON.stringify(currentVersions));
+      const existingDocsRaw = await this.redis.get(`project:${id}:documents`);
+      const existingDocs: string[] = existingDocsRaw ? JSON.parse(existingDocsRaw) : [];
+      const mergedDocs = Array.from(new Set([...existingDocs, ...dto.cids]));
+      await this.redis.set(`project:${id}:documents`, JSON.stringify(mergedDocs));
+    }
+
+    const response: UpdateCertificationsResponse = {
+      projectId: id,
+      certifications: currentVersions,
+      addedCount,
+      existingCount,
+      totalVersions: currentVersions.length,
+    };
+
+    if (dto.idempotencyKey) {
+      await this.redis.setEx(
+        `project:${id}:idempotency:${dto.idempotencyKey}`,
+        86400,
+        JSON.stringify(response),
+      );
+    }
+
+    return response;
+  }
+
 
   /**
    * Reconstruct which certification version justified a historical coupon
@@ -486,6 +599,76 @@ export class ProjectsService {
       .digest('hex');
 
     return payload;
+  }
+
+  async getDocument(projectId: number, hash: string): Promise<any> {
+    const isAudit = (await this.cacheService?.isAuditRelevant(hash)) ?? false;
+    try {
+      const result = await this.ipfsService.retrieveDocument(hash, { isAuditRelevant: isAudit });
+      return {
+        projectId,
+        hash,
+        status: 'available',
+        servedFrom: result.servedFrom,
+        filename: result.filename,
+        mimetype: result.mimetype,
+        content: result.content,
+        tier: result.tier,
+      };
+    } catch (err: any) {
+      if (err.name === 'IpfsUnavailableException') {
+        const health = await this.availabilityService?.getDocumentHealth(hash);
+        return {
+          statusCode: 503,
+          status: 'temporarily_unavailable',
+          hash,
+          projectId,
+          message:
+            'Document is temporarily unavailable across IPFS gateways. A cached recovery or escalation has been initiated.',
+          retryAfterSeconds: err.retryAfterSeconds || 30,
+          escalationPath: `/projects/${projectId}/documents/${hash}/escalate`,
+          health,
+        };
+      }
+      throw err;
+    }
+  }
+
+  async flagDocumentAsAudit(projectId: number, hash: string, disputeId?: string): Promise<any> {
+    const updated = await this.cacheService?.flagAsAuditRelevant(hash, disputeId);
+    return {
+      projectId,
+      hash,
+      tier: 'audit_relevant',
+      disputeId,
+      cached: Boolean(updated),
+      expiresAt: updated?.expiresAt,
+    };
+  }
+
+  async escalateDocument(projectId: number, hash: string): Promise<any> {
+    const warmed = (await this.availabilityService?.warmCacheFromGateway(hash, true)) ?? false;
+    await this.redis.sAdd(`project:${projectId}:escalated_documents`, hash);
+    return {
+      projectId,
+      hash,
+      escalationStatus: warmed ? 'recovered_to_cache' : 'retry_scheduled',
+      message: warmed
+        ? 'Document was successfully recovered and cached from an alternate gateway.'
+        : 'Document retrieval escalation queued across all protocol nodes.',
+    };
+  }
+
+  async getDocumentHealth(projectId: number, hash: string): Promise<any> {
+    return this.availabilityService?.getDocumentHealth(hash) ?? {
+      hash,
+      status: 'unavailable',
+      lastChecked: new Date().toISOString(),
+      primaryGatewayOk: false,
+      fallbackGatewayOk: false,
+      servedByCache: false,
+      failureCount: 1,
+    };
   }
 
   private getAdminSecret(): string {

@@ -1,15 +1,5 @@
-import { Test } from "@nestjs/testing";
-import { BadRequestException } from "@nestjs/common";
-import {
-  xdr,
-  scValToNative,
-  nativeToScVal,
-  Address,
-} from "@stellar/stellar-sdk";
-
-jest.mock("@redis/client", () => {
 import { Test } from '@nestjs/testing';
-import { BadRequestException, ForbiddenException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { xdr, scValToNative, nativeToScVal, Address } from '@stellar/stellar-sdk';
 import { ComplianceAttestationService } from '../compliance/services/compliance-attestation.service';
 import { ComplianceRulesEngine } from '../compliance/services/compliance-rules.engine';
@@ -179,6 +169,7 @@ describe("BondsService", () => {
             "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
         }),
       };
+      const snapshots = { capture: jest.fn().mockResolvedValue(undefined) };
 
       const moduleRef = await Test.createTestingModule({
         providers: [
@@ -939,5 +930,75 @@ describe("BondsService", () => {
       expect(contractService.invokeContractMethod).not.toHaveBeenCalled();
     });
   });
-});
+
+  describe("redeem", () => {
+    const validInvestor = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
+    it("throws BadRequestException if contract invocation fails with ContractException", async () => {
+      const contractService = {
+        invokeContractMethod: jest.fn().mockRejectedValue(
+          new ContractException('BOND_NOT_FOUND', 'Bond 999 not found', undefined, 'redeem', 4),
+        ),
+      };
+
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: contractService },
+          { provide: StellarService, useValue: {} },
+          { provide: NonceService, useValue: { next: jest.fn().mockResolvedValue(1) } },
+          redisProvider,
+          signingProvider,
+          configProvider,
+          holderIndexProvider,
+        ],
+      }).compile();
+
+      const svc = moduleRef.get(BondsService);
+
+      await expect(
+        svc.redeem(999, { amount: 100, investorAddress: validInvestor }),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it("successfully invokes redeem contract method and returns response", async () => {
+      const contractService = {
+        invokeContractMethod: jest.fn().mockResolvedValue({
+          transactionHash: 'tx-redeem-123',
+        }),
+      };
+
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          BondsService,
+          { provide: ContractService, useValue: contractService },
+          { provide: StellarService, useValue: {} },
+          { provide: NonceService, useValue: { next: jest.fn().mockResolvedValue(1) } },
+          redisProvider,
+          signingProvider,
+          configProvider,
+          holderIndexProvider,
+        ],
+      }).compile();
+
+      const svc = moduleRef.get(BondsService);
+
+      const result = await svc.redeem(1, { amount: 200, investorAddress: validInvestor });
+
+      expect(contractService.invokeContractMethod).toHaveBeenCalledWith(
+        'CBONDISSUERADDRESS',
+        'redeem',
+        'SINVESTOR',
+        expect.any(Array),
+        validInvestor,
+      );
+      expect(result).toEqual({
+        bondId: 1,
+        investorAddress: validInvestor,
+        amount: '200',
+        transactionHash: 'tx-redeem-123',
+        status: 'Redeemed',
+      });
+    });
+  });
 });

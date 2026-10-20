@@ -1,12 +1,16 @@
 import {
-  Controller, Get, Post, Body, Param, Query, Req, HttpCode, HttpStatus, UseGuards, ParseIntPipe, Header, NotFoundException, ForbiddenException
+  Controller, Get, Post, Body, Param, Query, Req, Res, HttpCode, HttpStatus, UseGuards, ParseIntPipe, Header, NotFoundException, ForbiddenException
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { BondsService } from './bonds.service';
+import { RegulatorExportService } from './regulator-export.service';
 import { CreateBondDto } from './dto/create-bond.dto';
 import { SubscribeDto } from './dto/subscribe.dto';
 import { DistributeCouponDto } from './dto/distribute-coupon.dto';
+import { DistributeCouponBatchDto } from './dto/distribute-coupon-batch.dto';
 import { ClaimCreditsDto } from './dto/claim-credits.dto';
 import { TransferBondDto } from './dto/transfer-bond.dto';
+import { RedeemBondDto } from './dto/redeem-bond.dto';
 import { PaginationDto } from '../common/dto/pagination.dto';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../common/guards/permissions.guard';
@@ -26,15 +30,21 @@ import {
   HolderListResponse,
   HeldBondResponse,
   CouponDistributionResponse,
+  CouponBatchStatusResponse,
+  CouponBatchDistributionResponse,
   ClaimCreditsResponse,
   TransferResponse,
   UndistributedTotalResponse,
   SweepUndistributedResponse,
   BondDetailResponse,
   ClaimableCreditsResponse,
+  RedeemResponse,
 } from './interfaces/bond.interface';
 
+
 import { CouponBacktestService, PerformanceDataset, BacktestReport } from './coupon-backtest.service';
+import { MaturedBondArchivalService, ArchiveBondDto, RestoreBondDto, ArchivalResult, RestoreResult, BondRestoreVerificationReport } from './matured-bond-archival.service';
+import { Optional } from '@nestjs/common';
 
 @ApiTags('bonds')
 @ApiBearerAuth()
@@ -42,7 +52,9 @@ import { CouponBacktestService, PerformanceDataset, BacktestReport } from './cou
 export class BondsController {
   constructor(
     private readonly bondsService: BondsService,
+    private readonly regulatorExportService: RegulatorExportService,
     private readonly backtestService: CouponBacktestService,
+    @Optional() private readonly archivalService?: MaturedBondArchivalService,
   ) {}
 
   @Post()
@@ -133,6 +145,33 @@ export class BondsController {
   ): Promise<CouponDistributionResponse> {
     return this.bondsService.distributeCoupon(id, dto);
   }
+
+  /**
+   * Bounded batch distribution for large holder sets (#456).
+   */
+  @Post(':id/coupon-batch')
+  @UseGuards(JwtAuthGuard, PermissionsGuard, IntentGuard)
+  @RequirePermissions(Permission.DISTRIBUTE_COUPON)
+  @RequireIntent('distribute_coupon')
+  @HttpCode(HttpStatus.OK)
+  async distributeCouponBatch(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: DistributeCouponBatchDto,
+  ): Promise<CouponBatchDistributionResponse> {
+    return this.bondsService.distributeCouponBatch(id, dto);
+  }
+
+  /**
+   * Query coupon batch progress and cursor for large distributions (#456).
+   */
+  @Get(':id/coupon-batch-status')
+  async getCouponBatchStatus(
+    @Param('id', ParseIntPipe) id: number,
+    @Query('periodIndex', ParseIntPipe) periodIndex: number,
+  ): Promise<CouponBatchStatusResponse> {
+    return this.bondsService.getCouponBatchStatus(id, periodIndex);
+  }
+
 
   @Post(':id/claim')
   @UseGuards(JwtAuthGuard, KycGuard)
@@ -233,15 +272,38 @@ export class BondsController {
     return this.bondsService.mature(id);
   }
 
+  @Post(':id/redeem')
+  @UseGuards(JwtAuthGuard, KycGuard)
+  @HttpCode(HttpStatus.OK)
+  async redeem(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: RedeemBondDto,
+    @Req() req: any,
+  ): Promise<RedeemResponse> {
+    if (req.user?.walletAddress && req.user.walletAddress !== dto.investorAddress) {
+      throw new ForbiddenException('Cannot redeem on behalf of another wallet address');
+    }
+    return this.bondsService.redeem(id, dto);
+  }
+
   @Get(':id/export')
   @UseGuards(JwtAuthGuard, PermissionsGuard)
   @RequirePermissions(Permission.EXPORT_BOND)
   async exportBond(
     @Param('id', ParseIntPipe) id: number,
+    @Query('format') format: string,
+    @Query('section') section: string,
     @Req() req: any,
-  ): Promise<any> {
+    @Res() res: Response,
+  ): Promise<void> {
     const auditorAddress = req.user?.walletAddress || '';
-    return this.bondsService.exportBond(id, auditorAddress);
+    const rendered = await this.regulatorExportService.export(id, auditorAddress, {
+      format,
+      section,
+    });
+    res.setHeader('Content-Type', rendered.contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${rendered.filename}"`);
+    res.send(rendered.body);
   }
 
   /**
@@ -265,5 +327,57 @@ export class BondsController {
 
     return this.backtestService.runBacktest(dataset, body.formulaVersion || 'COMPARE');
   }
+
+  @Post(':id/archive')
+  @RateLimit({ type: 'mutation' })
+  @HttpCode(HttpStatus.OK)
+  async archiveMaturedRecord(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: ArchiveBondDto,
+    @Req() req: any,
+  ): Promise<ArchivalResult> {
+    const caller = req.headers?.['x-wallet-address'] || req.user?.walletAddress || '';
+    if (!this.archivalService) {
+      throw new NotFoundException('MaturedBondArchivalService is not available');
+    }
+    return this.archivalService.archiveMaturedRecord(id, dto, caller);
+  }
+
+  @Post(':id/verify-restore')
+  @HttpCode(HttpStatus.OK)
+  async verifyRestore(
+    @Param('id', ParseIntPipe) id: number,
+  ): Promise<BondRestoreVerificationReport> {
+    if (!this.archivalService) {
+      throw new NotFoundException('MaturedBondArchivalService is not available');
+    }
+    return this.archivalService.verifyRestore(id);
+  }
+
+  @Post(':id/restore')
+  @RateLimit({ type: 'mutation' })
+  @HttpCode(HttpStatus.OK)
+  async restoreMaturedRecord(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: RestoreBondDto,
+    @Req() req: any,
+  ): Promise<RestoreResult> {
+    const caller = req.headers?.['x-wallet-address'] || req.user?.walletAddress || '';
+    if (!this.archivalService) {
+      throw new NotFoundException('MaturedBondArchivalService is not available');
+    }
+    return this.archivalService.restoreMaturedRecord(id, dto, caller);
+  }
+
+  @Get(':id/lifecycle')
+  async getArchivalLifecycle(
+    @Param('id', ParseIntPipe) id: number,
+  ) {
+    if (!this.archivalService) {
+      throw new NotFoundException('MaturedBondArchivalService is not available');
+    }
+    return this.archivalService.getArchivalLifecycle(id);
+  }
 }
+
 

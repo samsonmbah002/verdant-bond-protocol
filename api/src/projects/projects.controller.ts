@@ -1,11 +1,19 @@
 import {
-  Controller, Get, Post, Body, Param, Query, Req, UseGuards,
+  Controller, Get, Post, Put, Body, Param, Query, Req, UseGuards,
   HttpCode, HttpStatus, ParseIntPipe,
 } from '@nestjs/common';
 import { ProjectsService } from './projects.service';
 import { CreateProjectDto } from './dto/create-project.dto';
+import { UpdateProjectCertificationsDto } from './dto/update-certifications.dto';
 import { PaginationDto } from '../common/dto/pagination.dto';
-import { ProjectResponse, ProjectProvenanceResponse, CertificationVersion, CouponCertification } from './interfaces/project.interface';
+import {
+  ProjectResponse,
+  ProjectProvenanceResponse,
+  CertificationVersion,
+  CouponCertification,
+  UpdateCertificationsResponse,
+} from './interfaces/project.interface';
+
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../common/guards/permissions.guard';
 import { RequirePermissions } from '../common/decorators/permissions.decorator';
@@ -94,6 +102,22 @@ export class ProjectsController {
     return this.projectsService.addCertification(id, body.cid, body.kind ?? 'document');
   }
 
+  /**
+   * Idempotent project certification document updates (#459).
+   */
+  @Put(':id/certifications')
+  @HttpCode(HttpStatus.OK)
+  async updateCertifications(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: UpdateProjectCertificationsDto,
+    @Req() req: any,
+  ): Promise<UpdateCertificationsResponse> {
+    const callerAddress =
+      req.user?.walletAddress || req.headers['x-wallet-address'] || '';
+    return this.projectsService.updateProjectCertifications(id, dto, callerAddress);
+  }
+
+
   @Get(':id/certifications')
   async certificationHistory(
     @Param('id', ParseIntPipe) id: number,
@@ -108,5 +132,41 @@ export class ProjectsController {
     @Query('periodIndex', ParseIntPipe) periodIndex: number,
   ): Promise<CouponCertification> {
     return this.projectsService.getCouponCertification(id, bondId, periodIndex);
+  }
+
+  @Get(':id/documents/:hash')
+  async getDocument(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('hash') hash: string,
+  ): Promise<any> {
+    return this.projectsService.getDocument(id, hash);
+  }
+
+  @Post(':id/documents/:hash/flag-audit')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  async flagDocumentAsAudit(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('hash') hash: string,
+    @Body() body: { disputeId?: string },
+  ): Promise<any> {
+    return this.projectsService.flagDocumentAsAudit(id, hash, body?.disputeId);
+  }
+
+  @Post(':id/documents/:hash/escalate')
+  @HttpCode(HttpStatus.ACCEPTED)
+  async escalateDocument(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('hash') hash: string,
+  ): Promise<any> {
+    return this.projectsService.escalateDocument(id, hash);
+  }
+
+  @Get(':id/documents/:hash/health')
+  async getDocumentHealth(
+    @Param('id', ParseIntPipe) id: number,
+    @Param('hash') hash: string,
+  ): Promise<any> {
+    return this.projectsService.getDocumentHealth(id, hash);
   }
 }

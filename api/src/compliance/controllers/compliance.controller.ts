@@ -11,6 +11,7 @@ import {
   ForbiddenException,
   NotFoundException,
   Param,
+  Optional,
 } from '@nestjs/common';
 import { ComplianceRulesEngine } from '../services/compliance-rules.engine';
 import { ComplianceAttestationService } from '../services/compliance-attestation.service';
@@ -30,6 +31,10 @@ import {
 import { KycStoreService } from '../../common/services/kyc-store.service';
 
 import { KycCommitmentService, OnChainKycCommitment, RegulatorDisclosureRequest, RegulatorDisclosurePackage, EligibilityTier } from '../services/kyc-commitment.service';
+import {
+  InvestorRejectionExplanationService,
+  InvestorRejectionExplanationDto,
+} from '../services/investor-rejection-explanation.service';
 
 export class RequestAttestationDto {
   bondId: number;
@@ -55,6 +60,7 @@ export class ComplianceController {
     private readonly kycStore: KycStoreService,
     private readonly snapshots: ComplianceSnapshotService,
     private readonly kycCommitmentService: KycCommitmentService,
+    @Optional() private readonly explanationService?: InvestorRejectionExplanationService,
   ) {}
 
   @Get('snapshots/:eventId')
@@ -223,6 +229,83 @@ export class ComplianceController {
     @Body() body: { request: RegulatorDisclosureRequest; accessReason?: string },
   ): Promise<RegulatorDisclosurePackage> {
     return this.kycCommitmentService.generateRegulatorDisclosurePackage(body.request, body.accessReason);
+  }
+
+  /**
+   * Explain eligibility rejection with actionable investor guidance.
+   */
+  @Post('explain-eligibility-rejection')
+  @HttpCode(HttpStatus.OK)
+  async explainEligibilityRejection(
+    @Body() dto: EvaluateEligibilityDto,
+  ): Promise<InvestorRejectionExplanationDto> {
+    const kycRecord = await this.kycStore.get(dto.investorAddress);
+    const decision = this.rulesEngine.evaluateEligibility({
+      investorAddress: dto.investorAddress,
+      bondId: dto.bondId,
+      tranche: dto.tranche ?? TrancheType.STANDARD,
+      jurisdiction: dto.jurisdiction ?? 'US',
+      purchaseAmount: dto.purchaseAmount,
+      kycRecord: kycRecord
+        ? { status: kycRecord.status, expiresAt: kycRecord.expiresAt }
+        : undefined,
+    });
+
+    if (!this.explanationService) {
+      throw new NotFoundException('Explanation service not available');
+    }
+
+    return this.explanationService.explainEligibilityRejection(
+      {
+        investorAddress: dto.investorAddress,
+        bondId: dto.bondId,
+        tranche: dto.tranche ?? TrancheType.STANDARD,
+        jurisdiction: dto.jurisdiction ?? 'US',
+        purchaseAmount: dto.purchaseAmount,
+      },
+      decision,
+    );
+  }
+
+  /**
+   * Explain secondary transfer rejection with actionable investor guidance.
+   */
+  @Post('explain-transfer-rejection')
+  @HttpCode(HttpStatus.OK)
+  async explainTransferRejection(
+    @Body() dto: import('../interfaces/compliance.interface').TransferEligibilityContext,
+  ): Promise<InvestorRejectionExplanationDto> {
+    const toKycRecord = await this.kycStore.get(dto.toAddress);
+    const fromKycRecord = await this.kycStore.get(dto.fromAddress);
+    const decision = this.rulesEngine.evaluateTransferEligibility({
+      ...dto,
+      toKycRecord: toKycRecord ? { status: toKycRecord.status, expiresAt: toKycRecord.expiresAt } : undefined,
+      fromKycRecord: fromKycRecord ? { status: fromKycRecord.status, expiresAt: fromKycRecord.expiresAt } : undefined,
+    });
+
+    if (!this.explanationService) {
+      throw new NotFoundException('Explanation service not available');
+    }
+
+    return this.explanationService.explainTransferRejection(
+      dto,
+      decision.reason || decision.code || 'NON_COMPLIANT',
+    );
+  }
+
+  /**
+   * Retrieve rejection explanation by audit ID.
+   */
+  @Get('rejections/:auditId')
+  @UseGuards(JwtAuthGuard)
+  async getRejectionExplanation(
+    @Param('auditId') auditId: string,
+    @Req() req: any,
+  ): Promise<InvestorRejectionExplanationDto> {
+    if (!this.explanationService) {
+      throw new NotFoundException('Explanation service not available');
+    }
+    return this.explanationService.getExplanation(auditId, req.user);
   }
 }
 

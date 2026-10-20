@@ -19,6 +19,7 @@ import { QuotaGuard } from './common/guards/quota.guard';
 import { AuditInterceptor } from './common/interceptors/audit.interceptor';
 import { IdempotencyInterceptor } from './common/interceptors/idempotency.interceptor';
 import { OpsModule } from './ops/ops.module';
+import { PolicyModule } from './policy/policy.module';
 import { LedgerModule } from './ledger/ledger.module';
 import { WorkersModule } from './workers/workers.module';
 import { ReconciliationModule } from './reconciliation/reconciliation.module';
@@ -67,6 +68,7 @@ import { ImportsModule } from './imports/imports.module';
     AuthorizationsModule,
     StatusModule,
     HealthModule,
+    PolicyModule,
     ImportsModule,
   ],
   providers: [
