@@ -5,6 +5,7 @@ import { Permission } from '../auth/rbac';
 import { KycGuard } from '../common/guards/kyc.guard';
 import { ProviderGuard } from '../common/guards/provider.guard';
 import { IntentGuard } from '../common/guards/intent.guard';
+import { RiskGuard } from '../common/risk/risk.guard';
 import { AuthController } from '../auth/auth.controller';
 import { BondsController } from '../bonds/bonds.controller';
 import { OracleController } from '../oracle/oracle.controller';
@@ -48,7 +49,8 @@ export type GuardRef =
   | typeof PermissionsGuard
   | typeof KycGuard
   | typeof ProviderGuard
-  | typeof IntentGuard;
+  | typeof IntentGuard
+  | typeof RiskGuard;
 
 export type RouteRole = 'public' | 'wallet-header' | 'authenticated' | 'admin' | 'permissioned';
 
@@ -74,7 +76,7 @@ export const ROUTE_AUTHORIZATION_MATRIX: RouteAuthEntry[] = [
   { controller: AuthController, method: 'updateKyc', httpMethod: 'POST', path: 'auth/kyc/:address', guards: [JwtAuthGuard], role: 'authenticated', mutation: true },
 
   // ---- Bonds ----
-  { controller: BondsController, method: 'create', httpMethod: 'POST', path: 'bonds', guards: [JwtAuthGuard, PermissionsGuard, IntentGuard], role: 'permissioned', permissions: [Permission.CREATE_BOND], mutation: true },
+  { controller: BondsController, method: 'create', httpMethod: 'POST', path: 'bonds', guards: [JwtAuthGuard, PermissionsGuard, IntentGuard, RiskGuard], role: 'permissioned', permissions: [Permission.CREATE_BOND], mutation: true },
   { controller: BondsController, method: 'findAll', httpMethod: 'GET', path: 'bonds', guards: [], role: 'public', mutation: false },
   { controller: BondsController, method: 'findHeldByAddress', httpMethod: 'GET', path: 'bonds/held/:address', guards: [], role: 'public', mutation: false },
   { controller: BondsController, method: 'findOne', httpMethod: 'GET', path: 'bonds/:id', guards: [], role: 'public', mutation: false },
